@@ -315,6 +315,7 @@ if [ 0 -eq $daemon ]; then
   run_mode
 else
   info "Running $mode in daemon mode (frequency = ${frequency}s)."
+  configure_repo
   while true; do
     run_mode
     sleep $frequency
