@@ -5,9 +5,10 @@
 # author            : Alexander Agbidinoukoun
 # email             : aagbidin@cisco.com
 # date              : 14/11/2024
-# version           : 0.1
+# version           : 0.2
 # usage             : ./es_dr_tool.sh -c config.cfg -m primary|secondary
-# notes             :
+# notes             : 0.1 - 14/11/2024 - First release
+#                   : 0.2 - 19/11/2024 - Added option -r to create snapshot id file via ssh on the peer host (read-only filesystems)
 
 #==============================================================================
 
@@ -24,10 +25,13 @@ LOG_FILE=$(echo ${BASH_SOURCE[0]} | sed 's/sh$/log/')
 
 primary_snapshot_id_filename=primary_snapshot.id
 secondary_snapshot_id_filename=secondary_snapshot.id
+default_frequency=3600
+default_daemon=false
+default_remote=false
 
 usage() {
   cat <<EOF
-Usage: $(basename "${BASH_SOURCE[0]}") [-h] [-v] [-d] [-f frequency] -m primary|secondary -c config_file
+Usage: $(basename "${BASH_SOURCE[0]}") [-h] [-v] [-r] [-d] [-f frequency] -m primary|secondary -c config_file
 
 Manage AppDynamics Events Service automatic backup & restore
 
@@ -35,17 +39,18 @@ Available options:
 
 -h, --help        Print this help and exit
 -v, --verbose     Print script debug info
+-r, --remote      Enable remote update of snapshot id file for read-only filesystems. Default: $default_remote
 -c, --config      Path to config file
 -m, --mode        primary or secondary
--d, --daemon      Daemon mode. Default: false
--f, --frequency   In daemon mode, set the frequency in seconds at which the update is performed. Default: 60
+-d, --daemon      Daemon mode. Default: $default_daemon
+-f, --frequency   In daemon mode, set the frequency in seconds at which the tasks are performed. Default: $default_frequency
 
 EOF
   exit
 }
 
 setup_colors() {
-  if [ -t 2 ] && [ -z "${NO_COLOR-}" ] && [ "${TERM-}" != "dumb" ]; then
+  if [ -t 2 ] && [ -z "${_NO_COLOR-}" ] && [ "${TERM-}" != "dumb" ]; then
     NOFORMAT='\033[0m' RED='\033[0;31m' GREEN='\033[0;32m' ORANGE='\033[0;33m' BLUE='\033[0;34m' PURPLE='\033[0;35m' CYAN='\033[0;36m' YELLOW='\033[0;33m'
   else
     NOFORMAT='' RED='' GREEN='' ORANGE='' BLUE='' PURPLE='' CYAN='' YELLOW=''
@@ -85,15 +90,17 @@ info() {
 
 parse_params() {
   # default values of variables set from params
-  daemon=0
-  frequency=60
+  daemon=$default_daemon
+  frequency=$default_frequency
+  remote=$default_remote
 
   while :; do
     case "${1-}" in
     -h | --help) usage ;;
     -v | --verbose) set -x ;;
-    --no-color) NO_COLOR=1 ;;
-    -d | --daemon) daemon=1 ;;
+    --no-color) _NO_COLOR=1 ;;
+    -d | --daemon) daemon="true" ;;
+    -r | --remote) remote="true" ;;
     -c | --config)
       config="${2-}"
       shift
@@ -128,7 +135,7 @@ trap cleanup SIGINT SIGTERM EXIT
 cleanup() {
   trap - SIGINT SIGTERM EXIT
   # script cleanup here
-  if [ "$daemon" -eq 1 ]; then
+  if [ "$daemon" == "true" ]; then
     exit 255
   fi
 }
@@ -165,6 +172,7 @@ function configure_repo() {
   [ -z "${secondary_es_url-}" ] && die "Missing required config entry: secondary_es_url"
   [ -z "${primary_es_repo_path-}" ] && die "Missing required config entry: primary_es_repo_path"
   [ -z "${secondary_es_repo_path-}" ] && die "Missing required config entry: secondary_es_repo_path"
+  [ -z "${es_repo_name-}" ] && die "Missing required config entry: es_repo_name"
 
   readonly="false"
   [ $mode == "secondary" ] && readonly="true"
@@ -172,7 +180,6 @@ function configure_repo() {
   [ $mode == "secondary" ] && es_url=${secondary_es_url}
   es_repo_path=${primary_es_repo_path}
   [ $mode == "secondary" ] && es_repo_path=${secondary_es_repo_path}
-  es_repo_name=$(basename $es_repo_path)
 
   response=$(curl -s -X PUT ${es_url}/_snapshot/${es_repo_name} \
     -H 'Content-Type: application/json' \
@@ -188,6 +195,40 @@ function configure_repo() {
   [ -z "$(echo $response | grep '"acknowledged":true')" ] && die "Configuring snapshot repository failed: $response"
 }
 
+function update_id_file() {
+    value=$1
+    _remote=${2-}
+      # check required config entries
+      [ -z "${primary_es_path-}" ] && die "Missing required config entry: primary_es_path"
+      [ -z "${primary_es_repo_path-}" ] && die "Missing required config entry: primary_es_repo_path"
+      [ -z "${secondary_es_path-}" ] && die "Missing required config entry: primary_es_path"
+      [ -z "${secondary_es_repo_path-}" ] && die "Missing required config entry: primary_es_repo_path"
+
+
+    file=${primary_es_repo_path}/${primary_snapshot_id_filename}
+    [ $mode == "secondary" ] && file=${secondary_es_repo_path}/${secondary_snapshot_id_filename}
+ 
+    if  [ "$_remote" == "true" ]; then
+      info "Updating snapshot id file remotely."
+      # check required config entries
+      [ -z "${primary_host-}" ] && die "Missing required config entry: primary_host"
+      [ -z "${secondary_host-}" ] && die "Missing required config entry: secondary_host"
+
+     remote_host=$secondary_host
+      [ $mode == "secondary" ] && remote_host=$primary_host
+      remote_path=$secondary_es_repo_path
+      [ $mode == "secondary" ] && remote_path=$primary_es_repo_path
+
+      response=$(ssh $remote_host cd $remote_path && echo "$value" > $file)
+      [ ! $? ] && die "Remote command failed (Is passwordless ssh enabled?) : $response"
+    else
+      info "Updating snapshot id file locally."
+      path=$primary_es_repo_path
+      [ $mode == "secondary" ] && path=$secondary_es_repo_path
+      response=$(cd $path && echo "$value" > $file && cd -)
+      [ ! $? ] && die "Command failed : $response"
+    fi
+}
 
 function primary() {
 
@@ -195,7 +236,7 @@ function primary() {
     [ ! -r $config ] && die "$config is not readable"
     . $config
 
-      # check required config entries
+    # check required config entries
     [ -z "${primary_es_path-}" ] && die "Missing required config entry: primary_es_path"
     [ -z "${primary_es_repo_path-}" ] && die "Missing required config entry: primary_es_repo_path"
 
@@ -205,43 +246,49 @@ function primary() {
     # - there is no snapshot in progress already
     # - secondary has restored previous snapshot
 
-    info "Checking if snapshots exist..."
+    info "Checking if snapshots exist."
     snapshot_list=$(${primary_es_path}/processor/bin/events-service.sh snapshot-list -p ${primary_es_path}/processor/conf/events-service-api-store.properties)
     [ -z "$(echo $snapshot_list | grep 'No snapshots taken')" ] && snapshots_exist=true || snapshots_exist=false
     if  [ $snapshots_exist == false ]; then
-        info "No snapshots exist. Doing full snapshot..."
+        info "No snapshots exist. Doing full snapshot."
         do_snapshot
-        return $?
+
+        info "Refreshing snapshot list."
+        snapshot_list=$(${primary_es_path}/processor/bin/events-service.sh snapshot-list -p ${primary_es_path}/processor/conf/events-service-api-store.properties)
+        latest_snapshot_id=$(echo $snapshot_list | grep -Eo "1. snapshot\S+" | cut -d' ' -f 2)
+        update_id_file $latest_snapshot_id
+        return 0
     fi
 
-    info "Checking if snapshot is in progress..."
+    info "Checking if snapshot is in progress."
     snapshot_status=$(${primary_es_path}/processor/bin/events-service.sh snapshot-status -p ${primary_es_path}/processor/conf/events-service-api-store.properties)
     [ -z "$(echo $snapshot_status | grep 'Snapshot state is SUCCESS')" ] && snapshot_in_progress=true || snapshot_in_progress=false
     if  [ $snapshot_in_progress == true ]; then
+        [ -z "$(echo $snapshot_status | grep 'Snapshot state is SATRTED')" ] && die "Snapshot error: $snapshot_status"
         info "Snapshot already in progress. Cancelling."
         return 0
     fi
 
-    info "Checking if secondary has restored latest snapshot..."
+    info "Checking if secondary has restored latest snapshot."
     latest_snapshot_id=$(echo $snapshot_list | grep -Eo "1. snapshot\S+" | cut -d' ' -f 2)
     secondary_snapshot_id_file=${primary_es_repo_path}/${secondary_snapshot_id_filename}
     if [ ! -r ${secondary_snapshot_id_file} ] || [ ! "$(cat ${secondary_snapshot_id_file})" == "$latest_snapshot_id" ]; then
-        info "Snapshot not restored on secondary. Cancelling."
+        info "Latest snapshot not restored on secondary. Cancelling."
         return 0
     fi
 
-    info "Doing incremental snapshot..."
+    info "Doing incremental snapshot."
     do_snapshot
-    err=$?
 
-    info "Updating snapshot id file..."
+    info "Refreshing snapshot list."
     snapshot_list=$(${primary_es_path}/processor/bin/events-service.sh snapshot-list -p ${primary_es_path}/processor/conf/events-service-api-store.properties)
     latest_snapshot_id=$(echo $snapshot_list | grep -Eo "1. snapshot\S+" | cut -d' ' -f 2)
-    primary_snapshot_id_file=${primary_es_repo_path}/${primary_snapshot_id_filename}
-    echo $latest_snapshot_id > ${primary_snapshot_id_file}
+    update_id_file $latest_snapshot_id
 
-    return $err
+    return 0
 }
+
+
 
 function secondary() {
 
@@ -259,7 +306,7 @@ function secondary() {
     # - there is no snapshot restore in progress already
     # - there is a new snapshot that has not been restored already
 
-    info "Checking if snapshots exist..."
+    info "Checking if snapshots exist."
     snapshot_list=$(${secondary_es_path}/processor/bin/events-service.sh snapshot-list -p ${secondary_es_path}/processor/conf/events-service-api-store.properties)
     [ -z "$(echo $snapshot_list | grep 'No snapshots taken')" ] && snapshots_exist=true || snapshots_exist=false
     if  [ $snapshots_exist == false ]; then
@@ -267,7 +314,7 @@ function secondary() {
         return 0
     fi
 
-    info "Checking if snapshot restore is in progress..."
+    info "Checking if snapshot restore is in progress."
     latest_snapshot_id=$(echo $snapshot_list | grep -Eo "1. snapshot\S+" | cut -d' ' -f 2)
     secondary_snapshot_id_file=${secondary_es_repo_path}/${secondary_snapshot_id_filename}
 
@@ -279,19 +326,19 @@ function secondary() {
     else
          # if we land here there was a previous snapshot restore and it has completed
          if [ -r ${secondary_snapshot_id_file} ] && [ -z "$(cat ${secondary_snapshot_id_file})" ]; then
-            echo $latest_snapshot_id > ${secondary_snapshot_id_file}
-            info "Previous snapshot restore has completed. Updating snapshot id file & cancelling."
+            update_id_file $latest_snapshot_id $remote
+            info "Previous snapshot restore has completed. Cancelling."
             return 0
          fi
     fi
 
-    info "Checking if a new snapshot is available..."
+    info "Checking if a new snapshot is available."
      # if we land here this is the first snapshot restore
     if [ ! -r ${secondary_snapshot_id_file} ] || \
      # if we land here there is a previous restore that has completed and a new snapshot is available
-    [ -r ${secondary_snapshot_id_file} ] && [ ! -z "$(cat ${secondary_snapshot_id_file})" ] && [ ! "$(cat ${secondary_snapshot_id_file})" == "$latest_snapshot_id" ]; then
-      info "Doing snapshot restore..."
-      echo > ${secondary_snapshot_id_file} # we empty id file: it will be updated with latest id once the restore has completed
+    ([ ! -z "$(cat ${secondary_snapshot_id_file})" ] && [ ! "$(cat ${secondary_snapshot_id_file})" == "$latest_snapshot_id" ]); then
+      info "Doing snapshot restore."
+      update_id_file "" $remote # we empty id file: it will be updated with latest id once the restore has completed
       do_restore
       return $?
     else
@@ -309,7 +356,7 @@ function run_mode() {
   fi
 }
 
-if [ 0 -eq $daemon ]; then
+if [ ! $daemon == "true" ]; then
   info "Running $mode once."
   configure_repo
   run_mode
