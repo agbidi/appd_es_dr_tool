@@ -5,11 +5,12 @@
 # author            : Alexander Agbidinoukoun
 # email             : aagbidin@cisco.com
 # date              : 14/11/2024
-# version           : 0.2
-# usage             : ./es_dr_tool.sh -c config.cfg -m primary|secondary
+# version           : 0.3
+# usage             : ./es_dr_tool.sh -c config.cfg -m primary|secondary|cleanup
 # notes             : 0.1 - 14/11/2024 - First release
 #                   : 0.2 - 19/11/2024 - Added option -r to create snapshot id file via ssh on the peer host (read-only filesystems)
-
+#                   : 0.3 - 19/12/2024 - Added pre-restore operations to avoid issues with hidden indices. Added cleanup mode.
+#
 #==============================================================================
 
 set -Euo pipefail
@@ -28,10 +29,11 @@ secondary_snapshot_id_filename=secondary_snapshot.id
 default_frequency=3600
 default_daemon=false
 default_remote=false
+default_keep=1
 
 usage() {
-  cat <<EOF
-Usage: $(basename "${BASH_SOURCE[0]}") [-h] [-v] [-r] [-d] [-f frequency] -m primary|secondary -c config_file
+  cat <<_EOF
+Usage: $(basename "${BASH_SOURCE[0]}") [-h] [-v] [-r] [-d] [-f frequency] [-k keep] -m primary|secondary|cleanup -c config_file
 
 Manage AppDynamics Events Service automatic backup & restore
 
@@ -41,11 +43,12 @@ Available options:
 -v, --verbose     Print script debug info
 -r, --remote      Enable remote update of snapshot id file for read-only filesystems. Default: $default_remote
 -c, --config      Path to config file
--m, --mode        primary or secondary
+-m, --mode        Run mode. Valid options are: primary|secondary|cleanup
 -d, --daemon      Daemon mode. Default: $default_daemon
 -f, --frequency   In daemon mode, set the frequency in seconds at which the tasks are performed. Default: $default_frequency
+-k, --keep        In cleanup mode, number of snapshots to keep in repository. Default: $default_keep
 
-EOF
+_EOF
   exit
 }
 
@@ -92,6 +95,7 @@ parse_params() {
   # default values of variables set from params
   daemon=$default_daemon
   frequency=$default_frequency
+  keep=$default_keep
   remote=$default_remote
 
   while :; do
@@ -109,6 +113,10 @@ parse_params() {
       frequency="${2-}"
       shift
       ;;
+    -k | --keep)
+      keep="${2-}"
+      shift
+      ;;
     -m | --mode)
       mode="${2-}"
       shift
@@ -124,15 +132,15 @@ parse_params() {
   # check required params and arguments
   [ -z "${config-}" ] && warn "Missing required parameter: config" && usage
   [ -z "${mode-}" ] && warn "Missing required parameter: mode" && usage
-  [ $mode == "primary" ] || [ $mode == "secondary" ] || die "Unknown mode: $mode"
+  [ $mode == "primary" ] || [ $mode == "secondary" ] || [ $mode == "cleanup" ] || die "Unknown mode: $mode"
 
   #[ ${#args[@]} -eq 0 ] && die "Missing script arguments"
 
   return 0
 }
 
-trap cleanup SIGINT SIGTERM EXIT
-cleanup() {
+trap _cleanup SIGINT SIGTERM EXIT
+_cleanup() {
   trap - SIGINT SIGTERM EXIT
   # script cleanup here
   if [ "$daemon" == "true" ]; then
@@ -150,7 +158,7 @@ function do_snapshot() {
     [ -z "${primary_es_path-}" ] && die "Missing required config entry: primary_es_path"
     response=$(${primary_es_path}/processor/bin/events-service.sh snapshot-run -p ${primary_es_path}/processor/conf/events-service-api-store.properties)
     [ -z "$(echo $response | grep 'request executed successfully')" ] && die "Snapshot failed: $response"
-    info "Snapshot intiated successfully."
+    info "Snapshot initiated successfully."
 }
 
 function do_restore() {
@@ -158,7 +166,94 @@ function do_restore() {
     [ -z "${secondary_es_path-}" ] && die "Missing required config entry: secondary_es_path"
     response=$(${secondary_es_path}/processor/bin/events-service.sh snapshot-restore -p ${secondary_es_path}/processor/conf/events-service-api-store.properties)
     [ -z "$(echo $response | grep 'request executed successfully')" ] && die "Snapshot restore failed: $response"
-    info "Snapshot restore intiated successfully."
+    info "Snapshot restore initiated successfully."
+}
+
+function list_snapshots() {
+    # check required config entries
+    [ -z "${primary_es_path-}" ] && die "Missing required config entry: primary_es_path"
+    [ -z "${secondary_es_path-}" ] && die "Missing required config entry: secondary_es_path"
+    es_path=${primary_es_path}
+    [ $mode == "secondary" ] && es_path=${secondary_es_path}
+    response=$(${es_path}/processor/bin/events-service.sh snapshot-list -p ${es_path}/processor/conf/events-service-api-store.properties \
+    | grep SUCCESS | sed -E 's/^\S+ *\S+ *(\S+) .*$/\1/' | tr '\n' ' ')
+    echo $response 
+}
+
+function list_indices() {
+    regex=$1
+
+    # check required config entries
+    [ -z "${primary_es_url-}" ] && die "Missing required config entry: primary_es_url"
+    [ -z "${secondary_es_url-}" ] && die "Missing required config entry: secondary_es_url"
+
+    es_url=${primary_es_url}
+    [ $mode == "secondary" ] && es_url=${secondary_es_url}
+
+    response=$(curl -s "${es_url}/_cat/indices/${regex}" | sed -E 's/^\S+ *\S+ *(\S+) .*$/\1/' | tr '\n' ' ')
+    echo $response
+}
+
+function es_request() {
+  path=$1
+  method=$2
+
+  # check required config entries
+  [ -z "${primary_es_url-}" ] && die "Missing required config entry: primary_es_url"
+  [ -z "${secondary_es_url-}" ] && die "Missing required config entry: secondary_es_url"
+
+  es_url=${primary_es_url}
+  [ $mode == "secondary" ] && es_url=${secondary_es_url}
+
+  response=$(curl -s -X $method "${es_url}/${path}")
+    # validate response
+  [ -z "$(echo $response | grep '"acknowledged":true')" ] && die "ES request $path ($method) failed: $response"
+  echo $response
+}
+
+function close_index() {
+  index=$1
+  response=$(es_request "$index/_close" POST)
+}
+
+function open_index() {
+  index=$1
+  response=$(es_request "$index/_open" POST)
+}
+
+function start_ilm() {
+  response=$(es_request "_ilm/start" POST)
+}
+
+function stop_ilm() {
+  response=$(es_request "_ilm/stop" POST)
+}
+
+function delete_snapshot() {
+  repository=$1
+  snapshot=$2
+  response=$(es_request "_snapshot/$repository/$snapshot" DELETE)
+}
+
+function pre_restore_operations() {
+  info "Running pre-restore operations."
+  # Stop ilm
+  stop_ilm
+
+  # Close hidden indices
+  hidden_indices=$(list_indices ".*")
+  for index in $hidden_indices; do
+    close_index $index
+  done
+}
+
+function post_restore_operations() {
+  info "Running post-restore operations."
+
+  # Re-open hidden indices: this is done when restoring from primary
+
+  # Start ilm
+  start_ilm
 }
 
 function configure_repo() {
@@ -166,7 +261,6 @@ function configure_repo() {
   # source config file
   [ ! -r $config ] && die "$config is not readable"
   . $config
-
   # check required config entries
   [ -z "${primary_es_url-}" ] && die "Missing required config entry: primary_es_url"
   [ -z "${secondary_es_url-}" ] && die "Missing required config entry: secondary_es_url"
@@ -235,7 +329,6 @@ function primary() {
     # source config file
     [ ! -r $config ] && die "$config is not readable"
     . $config
-
     # check required config entries
     [ -z "${primary_es_path-}" ] && die "Missing required config entry: primary_es_path"
     [ -z "${primary_es_repo_path-}" ] && die "Missing required config entry: primary_es_repo_path"
@@ -252,21 +345,28 @@ function primary() {
     if  [ $snapshots_exist == false ]; then
         info "No snapshots exist. Doing full snapshot."
         do_snapshot
-
-        info "Refreshing snapshot list."
-        snapshot_list=$(${primary_es_path}/processor/bin/events-service.sh snapshot-list -p ${primary_es_path}/processor/conf/events-service-api-store.properties)
-        latest_snapshot_id=$(echo $snapshot_list | grep -Eo "1. snapshot\S+" | cut -d' ' -f 2)
-        update_id_file $latest_snapshot_id
+        update_id_file "" # we empty id file: it will be updated with latest id once the snapshot has completed
         return 0
     fi
 
     info "Checking if snapshot is in progress."
     snapshot_status=$(${primary_es_path}/processor/bin/events-service.sh snapshot-status -p ${primary_es_path}/processor/conf/events-service-api-store.properties)
+    primary_snapshot_id_file=${primary_es_repo_path}/${primary_snapshot_id_filename}
+
     [ -z "$(echo $snapshot_status | grep 'Snapshot state is SUCCESS')" ] && snapshot_in_progress=true || snapshot_in_progress=false
     if  [ $snapshot_in_progress == true ]; then
         [ -z "$(echo $snapshot_status | grep 'Snapshot state is SATRTED')" ] && die "Snapshot error: $snapshot_status"
         info "Snapshot already in progress. Cancelling."
         return 0
+    else
+        # if we land here there was a previous snapshot and it has completed
+        if [ -r ${primary_snapshot_id_file} ] && [ -z "$(cat ${primary_snapshot_id_file})" ]; then
+          info "Refreshing snapshot id."
+          snapshot_list=$(${primary_es_path}/processor/bin/events-service.sh snapshot-list -p ${primary_es_path}/processor/conf/events-service-api-store.properties)
+          latest_snapshot_id=$(echo $snapshot_list | grep -Eo "1. snapshot\S+" | cut -d' ' -f 2)
+          update_id_file $latest_snapshot_id
+          info "Snapshot has completed."
+        fi
     fi
 
     info "Checking if secondary has restored latest snapshot."
@@ -279,11 +379,7 @@ function primary() {
 
     info "Doing incremental snapshot."
     do_snapshot
-
-    info "Refreshing snapshot list."
-    snapshot_list=$(${primary_es_path}/processor/bin/events-service.sh snapshot-list -p ${primary_es_path}/processor/conf/events-service-api-store.properties)
-    latest_snapshot_id=$(echo $snapshot_list | grep -Eo "1. snapshot\S+" | cut -d' ' -f 2)
-    update_id_file $latest_snapshot_id
+    update_id_file "" # we empty id file: it will be updated with latest id once the snapshot has completed
 
     return 0
 }
@@ -295,7 +391,6 @@ function secondary() {
     # source config file
     [ ! -r $config ] && die "$config is not readable"
     . $config
-
       # check required config entries
     [ -z "${secondary_es_path-}" ] && die "Missing required config entry: primary_es_path"
     [ -z "${secondary_es_repo_path-}" ] && die "Missing required config entry: primary_es_repo_path"
@@ -327,8 +422,8 @@ function secondary() {
          # if we land here there was a previous snapshot restore and it has completed
          if [ -r ${secondary_snapshot_id_file} ] && [ -z "$(cat ${secondary_snapshot_id_file})" ]; then
             update_id_file $latest_snapshot_id $remote
-            info "Previous snapshot restore has completed. Cancelling."
-            return 0
+            post_restore_operations
+            info "Snapshot restore has completed."
          fi
     fi
 
@@ -339,11 +434,29 @@ function secondary() {
     ([ ! -z "$(cat ${secondary_snapshot_id_file})" ] && [ ! "$(cat ${secondary_snapshot_id_file})" == "$latest_snapshot_id" ]); then
       info "Doing snapshot restore."
       update_id_file "" $remote # we empty id file: it will be updated with latest id once the restore has completed
+      pre_restore_operations
       do_restore
       return $?
     else
       info "No new snapshot to restore. Cancelling."
     fi
+}
+
+function cleanup() {
+
+    # source config file
+    [ ! -r $config ] && die "$config is not readable"
+    . $config
+    # check required config entries
+    [ -z "${es_repo_name-}" ] && die "Missing required config entry: es_repo_name"
+
+    snapshots=$(list_snapshots)
+    i=0;
+    for s in $snapshots; do
+      i=$(($i + 1))
+      [ $i -gt $keep ] && info "Deleting snapshot $s" && delete_snapshot $es_repo_name $s
+    done
+
 }
 
 function run_mode() {
@@ -353,16 +466,19 @@ function run_mode() {
   elif [ $mode == "secondary" ]; then
     secondary
     return $?
+  elif [ $mode == "cleanup" ]; then
+    cleanup
+    return $?
   fi
 }
 
 if [ ! $daemon == "true" ]; then
   info "Running $mode once."
-  configure_repo
+  ([ $mode == "primary" ] || [ $mode == "secondary" ]) && configure_repo
   run_mode
 else
   info "Running $mode in daemon mode (frequency = ${frequency}s)."
-  configure_repo
+  ([ $mode == "primary" ] || [ $mode == "secondary" ]) && configure_repo
   while true; do
     run_mode
     sleep $frequency
