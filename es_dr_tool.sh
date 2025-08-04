@@ -355,7 +355,7 @@ function primary() {
 
     [ -z "$(echo $snapshot_status | grep 'Snapshot state is SUCCESS')" ] && snapshot_in_progress=true || snapshot_in_progress=false
     if  [ $snapshot_in_progress == true ]; then
-        [ -z "$(echo $snapshot_status | grep 'Snapshot state is SATRTED')" ] && die "Snapshot error: $snapshot_status"
+        [ -z "$(echo $snapshot_status | grep 'Snapshot state is STARTED')" ] && die "Snapshot error: $snapshot_status"
         info "Snapshot already in progress. Cancelling."
         return 0
     else
