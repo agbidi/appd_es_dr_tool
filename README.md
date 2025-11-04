@@ -30,8 +30,8 @@ primary_es_url=http://<es.primary.host>:9200<br>
 secondary_es_url=http://<es.secondary.host>:9200<br>
 primary_es_path=<appd_platform_home_primary>/product/events-service<br>
 secondary_es_path=<appd_platform_home_secondary>/product/events-service<br>
-primary_es_repo_path=<appd_platform_home_primary>/product/events-service/data/appdynamics-analytics-backup<br>
-secondary_es_repo_path=<appd_platform_home_secondary>/product/events-service/data/appdynamics-analytics-backup<br>
+primary_es_repo_path=<appd_platform_home_primary>/product/events-service/data/appdynamics-analytics-backup/appdynamics-events-service-cluster<br>
+secondary_es_repo_path=<appd_platform_home_secondary>/product/events-service/data/appdynamics-analytics-backup/appdynamics-events-service-cluster<br>
 es_repo_name=appdynamics-analytics-backup<br>
 
 Notes:
