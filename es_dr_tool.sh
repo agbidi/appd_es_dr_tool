@@ -364,7 +364,7 @@ function primary() {
           info "Refreshing snapshot id."
           snapshot_list=$(${primary_es_path}/processor/bin/events-service.sh snapshot-list -p ${primary_es_path}/processor/conf/events-service-api-store.properties)
           latest_snapshot_id=$(echo $snapshot_list | grep -Eo "1. snapshot\S+" | cut -d' ' -f 2)
-          update_id_file $latest_snapshot_id
+          update_id_file "$latest_snapshot_id"
           info "Snapshot has completed."
         fi
     fi
@@ -421,7 +421,7 @@ function secondary() {
     else
          # if we land here there was a previous snapshot restore and it has completed
          if [ -r ${secondary_snapshot_id_file} ] && [ -z "$(cat ${secondary_snapshot_id_file})" ]; then
-            update_id_file $latest_snapshot_id $remote
+            update_id_file "$latest_snapshot_id $remote"
             post_restore_operations
             info "Snapshot restore has completed."
          fi
